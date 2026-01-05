@@ -262,6 +262,44 @@ impl MemorySet {
             false
         }
     }
+
+    /// Check whether a virtual address range is completely unmapped.
+    pub fn is_range_free(&self, start: VirtAddr, end: VirtAddr) -> bool {
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            if let Some(pte) = self.page_table.translate(vpn) {
+                if pte.is_valid() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Unmap a virtual address range. Returns false if any page is not mapped.
+    pub fn unmap_range(&mut self, start: VirtAddr, end: VirtAddr) -> bool {
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            match self.page_table.translate(vpn) {
+                Some(pte) if pte.is_valid() => {}
+                _ => return false,
+            }
+        }
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            if let Some(area) = self
+                .areas
+                .iter_mut()
+                .find(|area| area.vpn_range.get_start() <= vpn && vpn < area.vpn_range.get_end())
+            {
+                area.unmap_one(&mut self.page_table, vpn);
+            } else {
+                return false;
+            }
+        }
+        true
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {

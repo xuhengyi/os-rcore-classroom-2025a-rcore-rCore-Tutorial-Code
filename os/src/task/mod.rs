@@ -24,6 +24,9 @@ pub use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
 
+/// Upper bound of syscall id that we track
+pub const MAX_SYSCALL_NUM: usize = 512;
+
 /// The task manager, where all the tasks are managed.
 ///
 /// Functions implemented on `TaskManager` deals with all task state transitions
@@ -201,4 +204,33 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Execute a closure with mutable access to the current task.
+pub fn with_current_task<T, F>(f: F) -> T
+where
+    F: FnOnce(&mut TaskControlBlock) -> T,
+{
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let cur = inner.current_task;
+    f(&mut inner.tasks[cur])
+}
+
+/// Increase syscall counter of current task.
+pub fn add_syscall_times(syscall_id: usize) {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    if syscall_id < MAX_SYSCALL_NUM {
+        let cur = inner.current_task;
+        inner.tasks[cur].syscall_times[syscall_id] += 1;
+    }
+}
+
+/// Get syscall counter of current task.
+pub fn syscall_times(syscall_id: usize) -> usize {
+    let inner = TASK_MANAGER.inner.exclusive_access();
+    if syscall_id < MAX_SYSCALL_NUM {
+        inner.tasks[inner.current_task].syscall_times[syscall_id]
+    } else {
+        0
+    }
 }

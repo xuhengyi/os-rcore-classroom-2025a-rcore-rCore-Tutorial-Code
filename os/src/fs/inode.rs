@@ -4,7 +4,7 @@
 //!
 //! `UPSafeCell<OSInodeInner>` -> `OSInode`: for static `ROOT_INODE`,we
 //! need to wrap `OSInodeInner` into `UPSafeCell`
-use super::File;
+use super::{File, Stat, StatMode};
 use crate::drivers::BLOCK_DEVICE;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
@@ -52,6 +52,22 @@ impl OSInode {
             v.extend_from_slice(&buffer[..len]);
         }
         v
+    }
+
+    /// Get stat information of this inode.
+    pub fn stat(&self) -> Stat {
+        let inner = self.inner.exclusive_access();
+        let inode_id = inner.inode.inode_id();
+        let is_dir = inner.inode.is_dir();
+        drop(inner);
+        let nlink = ROOT_INODE.links_count(inode_id) as u32;
+        Stat {
+            dev: 0,
+            ino: inode_id as u64,
+            mode: if is_dir { StatMode::DIR } else { StatMode::FILE },
+            nlink,
+            pad: [0; 7],
+        }
     }
 }
 
@@ -125,6 +141,36 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     }
 }
 
+/// Create a hard link to an existing file.
+pub fn link_file(old: &str, new: &str) -> bool {
+    if ROOT_INODE.find(new).is_some() {
+        return false;
+    }
+    if let Some(inode) = ROOT_INODE.find(old) {
+        ROOT_INODE.link(new, &inode)
+    } else {
+        false
+    }
+}
+
+/// Remove a directory entry, deallocating inode/data when reference count hits zero.
+pub fn unlink_file(name: &str) -> bool {
+    if let Some(inode) = ROOT_INODE.find(name) {
+        let inode_id = inode.inode_id();
+        if ROOT_INODE.unlink(name).is_none() {
+            return false;
+        }
+        let remain = ROOT_INODE.links_count(inode_id);
+        if remain == 0 {
+            inode.clear();
+            inode.dealloc_inode(inode_id);
+        }
+        true
+    } else {
+        false
+    }
+}
+
 impl File for OSInode {
     fn readable(&self) -> bool {
         self.readable
@@ -155,5 +201,8 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size
+    }
+    fn stat(&self) -> Stat {
+        OSInode::stat(self)
     }
 }

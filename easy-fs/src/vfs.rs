@@ -183,4 +183,118 @@ impl Inode {
         });
         block_cache_sync_all();
     }
+
+    /// Get inode id of current inode
+    pub fn inode_id(&self) -> u32 {
+        let fs = self.fs.lock();
+        fs.inode_id_from_pos(self.block_id as u32, self.block_offset)
+    }
+
+    /// Whether current inode is a directory
+    pub fn is_dir(&self) -> bool {
+        self.read_disk_inode(|disk_inode| disk_inode.is_dir())
+    }
+
+    /// Count hard links toward the given inode id under this directory.
+    pub fn links_count(&self, inode_id: u32) -> u32 {
+        let _fs = self.fs.lock();
+        self.read_disk_inode(|disk_inode| {
+            let file_count = (disk_inode.size as usize) / DIRENT_SZ;
+            let mut dirent = DirEntry::empty();
+            let mut cnt = 0;
+            for i in 0..file_count {
+                assert_eq!(
+                    disk_inode.read_at(
+                        i * DIRENT_SZ,
+                        dirent.as_bytes_mut(),
+                        &self.block_device,
+                    ),
+                    DIRENT_SZ,
+                );
+                if dirent.inode_id() == inode_id {
+                    cnt += 1;
+                }
+            }
+            cnt
+        })
+    }
+
+    /// Create a hard link under this directory to target inode.
+    pub fn link(&self, name: &str, target: &Arc<Inode>) -> bool {
+        let mut fs = self.fs.lock();
+        if self.read_disk_inode(|root_inode| self.find_inode_id(name, root_inode)).is_some() {
+            return false;
+        }
+        let target_id = target.inode_id();
+        self.modify_disk_inode(|root_inode| {
+            assert!(root_inode.is_dir());
+            let file_count = (root_inode.size as usize) / DIRENT_SZ;
+            let new_size = (file_count + 1) * DIRENT_SZ;
+            self.increase_size(new_size as u32, root_inode, &mut fs);
+            let dirent = DirEntry::new(name, target_id);
+            root_inode.write_at(
+                file_count * DIRENT_SZ,
+                dirent.as_bytes(),
+                &self.block_device,
+            );
+        });
+        block_cache_sync_all();
+        true
+    }
+
+    /// Remove a directory entry; return inode id if found.
+    pub fn unlink(&self, name: &str) -> Option<u32> {
+        let removed = self.modify_disk_inode(|root_inode| {
+            assert!(root_inode.is_dir());
+            let file_count = (root_inode.size as usize) / DIRENT_SZ;
+            let mut dirent = DirEntry::empty();
+            let mut target_idx = None;
+            for i in 0..file_count {
+                assert_eq!(
+                    root_inode.read_at(
+                        i * DIRENT_SZ,
+                        dirent.as_bytes_mut(),
+                        &self.block_device
+                    ),
+                    DIRENT_SZ,
+                );
+                if dirent.name() == name {
+                    target_idx = Some((i, dirent.inode_id()));
+                    break;
+                }
+            }
+            if let Some((idx, inode_id)) = target_idx {
+                if file_count > 1 && idx != file_count - 1 {
+                    let mut last = DirEntry::empty();
+                    assert_eq!(
+                        root_inode.read_at(
+                            (file_count - 1) * DIRENT_SZ,
+                            last.as_bytes_mut(),
+                            &self.block_device
+                        ),
+                        DIRENT_SZ
+                    );
+                    root_inode.write_at(idx * DIRENT_SZ, last.as_bytes(), &self.block_device);
+                }
+                // clear last entry and shrink size
+                root_inode.write_at(
+                    (file_count - 1) * DIRENT_SZ,
+                    DirEntry::empty().as_bytes(),
+                    &self.block_device,
+                );
+                root_inode.size = ((file_count - 1) * DIRENT_SZ) as u32;
+                Some(inode_id)
+            } else {
+                None
+            }
+        });
+        block_cache_sync_all();
+        removed
+    }
+
+    /// Deallocate an inode in bitmap.
+    pub fn dealloc_inode(&self, inode_id: u32) {
+        let mut fs = self.fs.lock();
+        fs.dealloc_inode(inode_id);
+    }
 }

@@ -9,6 +9,7 @@ use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE};
 use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
@@ -49,6 +50,26 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+
+    /// deadlock detection switch
+    pub deadlock_detect: bool,
+    /// owner tid of each mutex
+    pub mutex_owner: Vec<Option<usize>>,
+    /// semaphore state tracking
+    pub semaphore_state: Vec<Option<SemaphoreState>>,
+    /// waiting mutex for each tid
+    pub wait_mutex_for_tid: Vec<Option<usize>>,
+    /// waiting semaphore for each tid
+    pub wait_sem_for_tid: Vec<Option<usize>>,
+}
+
+/// Tracking info for a semaphore
+#[derive(Clone)]
+pub struct SemaphoreState {
+    /// available resources
+    pub available: isize,
+    /// current holders and their counts
+    pub holders: BTreeMap<usize, usize>,
 }
 
 impl ProcessControlBlockInner {
@@ -81,6 +102,92 @@ impl ProcessControlBlockInner {
     /// get a task with tid in this process
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
         self.tasks[tid].as_ref().unwrap().clone()
+    }
+
+    /// Ensure wait-tracking vectors cover tid.
+    pub fn ensure_tid_entry(&mut self, tid: usize) {
+        while self.wait_mutex_for_tid.len() <= tid {
+            self.wait_mutex_for_tid.push(None);
+        }
+        while self.wait_sem_for_tid.len() <= tid {
+            self.wait_sem_for_tid.push(None);
+        }
+    }
+
+    /// Ensure mutex tracking covers given id.
+    pub fn ensure_mutex_entry(&mut self, id: usize) {
+        while self.mutex_owner.len() <= id {
+            self.mutex_owner.push(None);
+        }
+    }
+
+    /// Ensure semaphore tracking covers given id, initialize if provided.
+    pub fn ensure_sem_entry(&mut self, id: usize, init_available: Option<isize>) {
+        while self.semaphore_state.len() <= id {
+            self.semaphore_state.push(None);
+        }
+        if let Some(avail) = init_available {
+            self.semaphore_state[id] = Some(SemaphoreState {
+                available: avail,
+                holders: BTreeMap::new(),
+            });
+        }
+    }
+
+    /// Deadlock detection: check if adding edges from `from` to `deps` forms a cycle.
+    pub fn would_deadlock(&self, from: usize, deps: &[usize]) -> bool {
+        let n = self
+            .wait_mutex_for_tid
+            .len()
+            .max(self.wait_sem_for_tid.len())
+            .max(from + 1);
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        // existing wait edges: mutex
+        for (tid, waiting) in self.wait_mutex_for_tid.iter().enumerate() {
+            if let Some(mid) = waiting {
+                if *mid < self.mutex_owner.len() {
+                    if let Some(owner) = self.mutex_owner[*mid] {
+                        adj[tid].push(owner);
+                    }
+                }
+            }
+        }
+        // existing wait edges: semaphore
+        for (tid, waiting) in self.wait_sem_for_tid.iter().enumerate() {
+            if let Some(sid) = waiting {
+                if *sid < self.semaphore_state.len() {
+                    if let Some(state) = &self.semaphore_state[*sid] {
+                        for (&owner, _) in state.holders.iter() {
+                            adj[tid].push(owner);
+                        }
+                    }
+                }
+            }
+        }
+        // proposed edges
+        for &d in deps {
+            adj[from].push(d);
+        }
+        fn dfs(v: usize, adj: &[Vec<usize>], visited: &mut [bool], stack: &mut [bool]) -> bool {
+            if stack[v] {
+                return true;
+            }
+            if visited[v] {
+                return false;
+            }
+            visited[v] = true;
+            stack[v] = true;
+            for &nxt in &adj[v] {
+                if dfs(nxt, adj, visited, stack) {
+                    return true;
+                }
+            }
+            stack[v] = false;
+            false
+        }
+        let mut visited = vec![false; n];
+        let mut stack = vec![false; n];
+        dfs(from, &adj, &mut visited, &mut stack)
     }
 }
 
@@ -119,6 +226,11 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect: false,
+                    mutex_owner: Vec::new(),
+                    semaphore_state: Vec::new(),
+                    wait_mutex_for_tid: Vec::new(),
+                    wait_sem_for_tid: Vec::new(),
                 })
             },
         });
@@ -144,6 +256,7 @@ impl ProcessControlBlock {
         // add main thread to the process
         let mut process_inner = process.inner_exclusive_access();
         process_inner.tasks.push(Some(Arc::clone(&task)));
+        process_inner.ensure_tid_entry(task.inner_exclusive_access().res.as_ref().unwrap().tid);
         drop(process_inner);
         insert_into_pid2process(process.getpid(), Arc::clone(&process));
         // add main thread to scheduler
@@ -245,6 +358,11 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect: false,
+                    mutex_owner: Vec::new(),
+                    semaphore_state: Vec::new(),
+                    wait_mutex_for_tid: Vec::new(),
+                    wait_sem_for_tid: Vec::new(),
                 })
             },
         });
@@ -267,6 +385,9 @@ impl ProcessControlBlock {
         // attach task to child process
         let mut child_inner = child.inner_exclusive_access();
         child_inner.tasks.push(Some(Arc::clone(&task)));
+        child_inner.ensure_tid_entry(
+            task.inner_exclusive_access().res.as_ref().unwrap().tid,
+        );
         drop(child_inner);
         // modify kstack_top in trap_cx of this thread
         let task_inner = task.inner_exclusive_access();
